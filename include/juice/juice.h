@@ -75,11 +75,12 @@ typedef enum juice_concurrency_mode {
 	JUICE_CONCURRENCY_MODE_MUX,      // Connections are multiplexed on a single UDP socket
 	JUICE_CONCURRENCY_MODE_THREAD,   // Each connection runs in its own thread
 
-	JUICE_CONCURRENCY_MODE_USER,     // Connections are manually polled by the user...
+	JUICE_CONCURRENCY_MODE_USER,     // Agents must be updated via calls to juice_user_poll...
 	                                 // Note:
-									 // - juice api calls that reference an agent using this mode must be non-concurrent
-	                                 // - The OS's UDP packet buffering capacity is limited you need to make sure the inflow of packets will not cause a bottleneck 
-	                                 // - ICE keepalive requirements necessitate regular polling RFC 8445 11.
+	                                 // - ICE keepalive requires regular polling RFC 8445 11.
+	                                 // - The OS's UDP packet buffering capacity is limited you need to make
+	                                 //   sure the inflow of packets will not cause a bottleneck/packet loss
+	                                 // - Also DNS resolution blocks in this mode
 } juice_concurrency_mode_t;
 
 typedef struct juice_config {
@@ -122,9 +123,21 @@ JUICE_EXPORT int juice_get_selected_addresses(juice_agent_t *agent, char *local,
                                               char *remote, size_t remote_size);
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
 
-// JUICE_CONCURRENCY_MODE_USER specific interface
-
-JUICE_EXPORT int juice_user_poll(juice_agent_t **agents, int agents_count);
+// Valid for JUICE_CONCURRENCY_MODE_USER only
+//
+// Non-blocking tries to read a datagram from `agent`'s socket. Forwards Non-ICE packets to you via the `on_recv`.
+// You shouldn't use data in `buffer` directly since it might be a STUN packet, contain TURN headers, etc;
+// The intended use of passing `buffer` is to give finer control to the user e.g. zero-copy
+// 
+// Parameters:
+// - `agent`: A pointer to an `juice_agent_t` structure initialized with `juice_create_agent()`.
+// - `buffer`: A pointer to the buffer where the received data will be stored It should accommodate
+//             the largest datagram you expect to receive (INCLUDING TURN HEADERS) otherwise, data will be truncated
+//
+// Returns:
+// - Positive number: Indicates the number of bytes received (0 means no more datagrams)
+// - Negative number: Indicates an error occurred
+JUICE_EXPORT int juice_user_poll(juice_agent_t *agent, char *buffer, size_t size);
 
 // ICE server
 

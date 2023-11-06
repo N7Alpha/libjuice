@@ -19,14 +19,15 @@ typedef enum conn_state { CONN_STATE_NEW = 0, CONN_STATE_READY, CONN_STATE_FINIS
 typedef struct conn_impl {
 	conn_state_t state;
 	socket_t sock;
+	mutex_t mutex;
+	mutex_t send_mutex;
 	int send_ds;
 	timestamp_t next_timestamp;
 } conn_impl_t;
 
-static inline int conn_user_process(juice_agent_t **agents, int agents_count, uint32_t *has_packets_pending, char *buffer);
 static inline int conn_user_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src);
 
-JUICE_EXPORT int juice_user_poll(juice_agent_t *agent, char *buffer, size_t buffer_size) {
+JUICE_EXPORT int juice_user_poll(juice_agent_t *agent, char *buffer, size_t size) {
 	if (!agent || !buffer)
 		return JUICE_ERR_INVALID;
 	
@@ -35,37 +36,49 @@ JUICE_EXPORT int juice_user_poll(juice_agent_t *agent, char *buffer, size_t buff
 	if (!conn_impl)
 		return JUICE_ERR_INVALID;
 
-	if (conn_impl->state == CONN_STATE_FINISHED)
+	mutex_lock(&conn_impl->mutex);
+
+	if (conn_impl->state == CONN_STATE_FINISHED) {
+		mutex_unlock(&conn_impl->mutex);
 		return JUICE_ERR_FAILED;
+	}
 
 	if (agent->config.concurrency_mode != JUICE_CONCURRENCY_MODE_USER) {
 		JLOG_ERROR("agent->config.concurrency_mode=%d Only JUICE_CONCURRENCY_MODE_USER (%d) is supported", 
 		            agent->config.concurrency_mode, JUICE_CONCURRENCY_MODE_USER);
+		mutex_unlock(&conn_impl->mutex);
 		return JUICE_ERR_INVALID;
 	}
 
 	addr_record_t src;
-	int ret = conn_user_recv(conn_impl->sock, buffer, buffer_size, &src);
+	int ret = conn_user_recv(conn_impl->sock, buffer, size, &src);
 
 	if (ret < 0) {
 		agent_conn_fail(agent);
 		conn_impl->state = CONN_STATE_FINISHED;
+		mutex_unlock(&conn_impl->mutex);
 		return JUICE_ERR_FAILED;
 	} else if (ret > 0) {
 		if (agent_conn_recv(agent, buffer, (size_t)ret, &src) != 0) {
 			JLOG_WARN("Agent receive failed");
 			conn_impl->state = CONN_STATE_FINISHED;
+			mutex_unlock(&conn_impl->mutex);
 			return JUICE_ERR_FAILED;
 		}
 	}
 
-	// Update the ICE agent... calling this everytime might be expensive
-	if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
-		JLOG_WARN("Agent update failed");
-		conn_impl->state = CONN_STATE_FINISHED;
-		return JUICE_ERR_FAILED;
+	if (   ret > 0 // We just received a datagram
+	    || conn_impl->next_timestamp <= current_timestamp()
+	    || agent->state != JUICE_STATE_COMPLETED) {
+		if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
+			JLOG_WARN("Agent update failed");
+			conn_impl->state = CONN_STATE_FINISHED;
+			mutex_unlock(&conn_impl->mutex);
+			return JUICE_ERR_FAILED;
+		}
 	}
 
+	mutex_unlock(&conn_impl->mutex);
 	return ret;
 }
 
@@ -105,6 +118,9 @@ int conn_user_init(juice_agent_t *agent, conn_registry_t *registry, udp_socket_c
 		return -1;
 	}
 
+	mutex_init(&conn_impl->mutex, 0);
+	mutex_init(&conn_impl->send_mutex, 0);
+
 	agent->conn_impl = conn_impl;
 
 	return JUICE_ERR_SUCCESS;
@@ -114,14 +130,20 @@ void conn_user_cleanup(juice_agent_t *agent) {
 	conn_impl_t *conn_impl = agent->conn_impl;
 
 	closesocket(conn_impl->sock);
+	mutex_destroy(&conn_impl->mutex);
+	mutex_destroy(&conn_impl->send_mutex);
 	free(agent->conn_impl);
 	agent->conn_impl = NULL;
 }
 
 void conn_user_lock(juice_agent_t *agent) {
+	conn_impl_t *conn_impl = agent->conn_impl;
+	mutex_lock(&conn_impl->mutex);
 }
 
 void conn_user_unlock(juice_agent_t *agent) {
+	conn_impl_t *conn_impl = agent->conn_impl;
+	mutex_unlock(&conn_impl->mutex);
 }
 
 int conn_user_interrupt(juice_agent_t *agent) {
@@ -132,6 +154,8 @@ int conn_user_interrupt(juice_agent_t *agent) {
 int conn_user_send(juice_agent_t *agent, const addr_record_t *dst, const char *data, size_t size,
                    int ds) {
 	conn_impl_t *conn_impl = agent->conn_impl;
+
+	mutex_lock(&conn_impl->send_mutex);
 
 	if (conn_impl->send_ds >= 0 && conn_impl->send_ds != ds) {
 		JLOG_VERBOSE("Setting Differentiated Services field to 0x%X", ds);
@@ -153,6 +177,7 @@ int conn_user_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 			JLOG_WARN("Send failed, errno=%d", sockerrno);
 	}
 
+	mutex_unlock(&conn_impl->send_mutex);
 	return ret;
 }
 
